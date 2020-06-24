@@ -6,6 +6,7 @@ python3 run_classifier_word.py \
   --task_name DLCompetition \
   --do_train \
   --do_eval \
+  --do_test \
   --data_dir $DATA_DIR \
   --vocab_file $BERT_BASE_DIR/vocab.txt \
   --bert_config_file $BERT_BASE_DIR/bert_config.json \

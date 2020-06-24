@@ -23,11 +23,13 @@ import os
 import logging
 import argparse
 import random
+import time
 from tqdm import tqdm, trange
 
 import numpy as np
 import pandas as pd
 import torch
+# RandomSampler: i.e. shuffle data
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
@@ -105,7 +107,12 @@ class DLCompetitionProcessor(DataProcessor):
     def get_dev_examples(self, data_dir: str):
         """See base class."""
         return self._create_examples(
-            self._read_csv(os.path.join(data_dir, "test_data.csv")), "test")
+            self._read_csv(os.path.join(data_dir, "train_data.csv")), "dev")
+
+    def get_test_examples(self, data_dir: str):
+        """See base class."""
+        return self._create_examples(
+            self._read_csv(os.path.join(data_dir, "test_data.csv")), "test")   
 
     def get_labels(self):
         """See base class."""
@@ -115,15 +122,20 @@ class DLCompetitionProcessor(DataProcessor):
         """Creates examples for the training and dev sets."""
         examples = []
         for i, row in df.iterrows():
-            if i == 0:
-                continue
-            guid = row['ID']
+            if set_type == 'test':
+                guid = row['id']
+            else:
+                guid = row['ID']
+
             text_a = tokenization.convert_to_unicode(row['title'])
             if pd.isna(row['keyword']):
                 text_b = ''
             else:
                 text_b = tokenization.convert_to_unicode(row['keyword'])
-            label = tokenization.convert_to_unicode(str(row['label']))
+            if set_type == 'test':
+                label = None
+            else:
+                label = tokenization.convert_to_unicode(str(row['label']))
             examples.append(
                 InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
         return examples
@@ -204,7 +216,11 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
 
-        label_id = label_map[example.label]
+        if not example.label:
+            label_id = None
+        else:
+            label_id = label_map[example.label]
+        
         if ex_index < 5:
             logger.info("*** Example ***")
             logger.info("guid: %s" % (example.guid))
@@ -214,7 +230,10 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
             logger.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
             logger.info(
                 "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-            logger.info("label: %s (id = %d)" % (example.label, label_id))
+            if label_id:
+                logger.info("label: %s (id = %d)" % (example.label, label_id))
+            else:
+                logger.info("label: None")
 
         features.append(
             InputFeatures(
@@ -329,6 +348,10 @@ def main():
                         default=False,
                         action='store_true',
                         help="Whether to run eval on the dev set.")
+    parser.add_argument("--do_test",
+                        default=False,
+                        action='store_true',
+                        help="Whether to run prediction on the test set.")
     parser.add_argument("--train_batch_size",
                         default=32,
                         type=int,
@@ -413,7 +436,7 @@ def main():
     if n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-    if not args.do_train and not args.do_eval:
+    if not args.do_train and not args.do_eval and not args.do_test:
         raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
     bert_config = BertConfig.from_json_file(args.bert_config_file)
@@ -496,7 +519,6 @@ def main():
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
-
             train_sampler = RandomSampler(train_data)
             # train_sampler = DistributedSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
@@ -555,7 +577,6 @@ def main():
         if args.local_rank == -1:
             eval_sampler = SequentialSampler(eval_data)
         else:
-
             eval_sampler = SequentialSampler(eval_data)
             # eval_sampler = DistributedSampler(eval_data)
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
@@ -596,6 +617,46 @@ def main():
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
+
+
+    if args.do_test:
+        # prediction
+        test_examples = processor.get_test_examples(args.data_dir)
+        test_features = convert_examples_to_features(
+            test_examples, label_list, args.max_seq_length, tokenizer)
+        logger.info("***** Running prediction *****")
+        logger.info("  Num examples = %d", len(test_examples))
+        logger.info("  Batch size = %d", args.eval_batch_size)
+        all_input_ids = torch.tensor([f.input_ids for f in test_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in test_features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in test_features], dtype=torch.long)
+        test_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids)
+        if args.local_rank == -1:
+            test_sampler = SequentialSampler(test_data)
+        else:
+            test_sampler = SequentialSampler(test_data)
+            # test_sampler = DistributedSampler(test_data)
+        test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=args.eval_batch_size)
+
+        model.eval()
+        answer = []
+        for input_ids, input_mask, segment_ids in test_dataloader:
+            input_ids = input_ids.to(device)
+            input_mask = input_mask.to(device)
+            segment_ids = segment_ids.to(device)
+
+            with torch.no_grad():
+                logits = model(input_ids, segment_ids, input_mask)
+
+            logits = logits.detach().cpu().tolist()
+            answer.extend(logits)
+
+        output_test_prediction = os.path.join(args.output_dir, time.strftime("%Y%m%d-%H%M%S") + "submission.csv")
+        with open(output_test_prediction, "w") as writer:
+            logger.info("Writing prediction")
+            writer.write("id,label\n")
+            for i, ans in answer:
+                writer.write("%d,%d\n" % (i, ans))
 
 
 if __name__ == "__main__":
